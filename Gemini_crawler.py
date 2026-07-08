@@ -19,7 +19,7 @@ def main():
 
     # 初始化 Gemini
     genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-1.5-flash')
+    model = genai.GenerativeModel('gemini-pro')
 
     ticker = "2330.TW"
     
