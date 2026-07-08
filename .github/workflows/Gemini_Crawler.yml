@@ -19,9 +19,9 @@ jobs:
       - name: Install dependencies # 步驟 3：安裝程式所需的套件
         run: pip install yfinance google-generativeai requests # 安裝爬蟲、Gemini API 及請求套件
         
-      - name: Run crawler        # 步驟 4：執行你的 Python 程式
-        env:                     # 從 GitHub Secrets 中載入敏感金鑰，注入為環境變數
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }} # 你的 Gemini API 金鑰
-          LINE_TOKEN: ${{ secrets.LINE_TOKEN }}         # 你的 LINE Token
-          LINE_USER_ID: ${{ secrets.LINE_USER_ID }}     # 你的 LINE User ID
-        run: python Gemini_crawler.py # 執行指定的 Python 檔案
+      - name: Run crawler
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          LINE_TOKEN: ${{ secrets.LINE_TOKEN }}
+          LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
+        run: python Gemini_crawler.py
