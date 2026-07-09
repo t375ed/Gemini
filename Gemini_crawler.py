@@ -5,13 +5,13 @@ import requests
 import sys
 
 def main():
-    # 讀取環境變數並進行偵測
+    # 讀取環境變數
     GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
     LINE_TOKEN = os.environ.get("LINE_TOKEN")
     USER_ID = os.environ.get("LINE_USER_ID")
-
-    print(f"DEBUG: GEMINI_API_KEY 是否存在: {bool(GEMINI_API_KEY)}")
-    print(f"DEBUG: LINE_TOKEN 是否存在: {bool(LINE_TOKEN)}")
+    
+    # 【新增】明確標示使用的模型版本
+    MODEL_VERSION = 'gemini-3.5-flash'
 
     if not GEMINI_API_KEY:
         print("錯誤: 未設定 GEMINI_API_KEY")
@@ -19,34 +19,50 @@ def main():
 
     # 初始化 Gemini
     genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-3.5-flash')
+    model = genai.GenerativeModel(MODEL_VERSION)
 
     ticker = "2330.TW"
     
-    # 抓取資料
     try:
         stock = yf.Ticker(ticker)
         hist = stock.history(period="1mo")
         if hist.empty:
-            print(f"錯誤: 無法取得 {ticker} 資料")
             sys.exit(1)
         data_summary = hist.tail(5).to_string()
         
-        # AI 分析
-        prompt = f"你是一位財經專家。以下是 {ticker} 近期股價：\n{data_summary}\n請提供簡短專業的波段趨勢建議。"
+        # 【修改】提示詞，要求 AI 輸出適合手機閱讀的格式
+        prompt = f"""
+        你是一位財經專家。以下是 {ticker} 近期股價數據：
+        {data_summary}
+        請提供簡短專業的波段趨勢建議。
+        要求：
+        1. 使用條列式重點。
+        2. 重要數據請加粗。
+        3. 內容保持精簡，適合手機小螢幕閱讀。
+        """
         response = model.generate_content(prompt)
         analysis = response.text
+        
+        # 【修改】排版訊息，加入模型版本資訊
+        final_message = (
+            f"📈 【台股分析報告】\n"
+            f"目標標的：{ticker}\n"
+            f"AI 模型：{MODEL_VERSION}\n"
+            f"--------------------------\n"
+            f"{analysis}\n"
+            f"--------------------------\n"
+            f"⚠️ 投資請審慎評估風險"
+        )
         
         # LINE 推播
         if LINE_TOKEN and USER_ID:
             url = "https://api.line.me/v2/bot/message/push"
             headers = {"Authorization": f"Bearer {LINE_TOKEN}", "Content-Type": "application/json"}
-            payload = {"to": USER_ID, "messages": [{"type": "text", "text": f"【AI 分析】\n{analysis}"}]}
+            payload = {"to": USER_ID, "messages": [{"type": "text", "text": final_message}]}
             requests.post(url, headers=headers, json=payload)
             print("訊息已發送")
         else:
-            print("未設定 LINE 變數，跳過發送")
-            print(f"分析內容: {analysis}")
+            print(final_message)
             
     except Exception as e:
         print(f"執行錯誤: {e}")
