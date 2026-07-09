@@ -2,71 +2,71 @@ import os
 import yfinance as yf
 import google.generativeai as genai
 import requests
-import sys
+
+# 設定參數
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+LINE_TOKEN = os.environ.get("LINE_TOKEN")
+USER_ID = os.environ.get("LINE_USER_ID")
+MODEL_VERSION = 'gemini-3.5-flash'
+
+# 初始化 Gemini
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel(MODEL_VERSION)
+
+def get_stock_data(tickers):
+    """取得多個股票的近期歷史數據"""
+    data_list = []
+    # 使用 yf.Tickers 批次處理
+    tickers_data = yf.Tickers(" ".join(tickers))
+    for ticker in tickers:
+        hist = tickers_data.tickers[ticker].history(period="1mo")
+        if not hist.empty:
+            summary = hist.tail(3).to_string()
+            data_list.append(f"【{ticker}】\n{summary}")
+    return "\n\n".join(data_list)
 
 def main():
-    # 讀取環境變數
-    GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-    LINE_TOKEN = os.environ.get("LINE_TOKEN")
-    USER_ID = os.environ.get("LINE_USER_ID")
+    tw_tickers = ["2330.TW", "0050.TW"]
+    us_tickers = ["NVDA", "AMD", "MU"]
     
-    # 【新增】明確標示使用的模型版本
-    MODEL_VERSION = 'gemini-3.5-flash'
-
-    if not GEMINI_API_KEY:
-        print("錯誤: 未設定 GEMINI_API_KEY")
-        sys.exit(1)
-
-    # 初始化 Gemini
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel(MODEL_VERSION)
-
-    ticker = "2330.TW"
+    # 獲取數據
+    tw_data = get_stock_data(tw_tickers)
+    us_data = get_stock_data(us_tickers)
     
-    try:
-        stock = yf.Ticker(ticker)
-        hist = stock.history(period="1mo")
-        if hist.empty:
-            sys.exit(1)
-        data_summary = hist.tail(5).to_string()
-        
-        # 【修改】提示詞，要求 AI 輸出適合手機閱讀的格式
-        prompt = f"""
-        你是一位財經專家。以下是 {ticker} 近期股價數據：
-        {data_summary}
-        請提供簡短專業的波段趨勢建議。
-        要求：
-        1. 使用條列式重點。
-        2. 重要數據請加粗。
-        3. 內容保持精簡，適合手機小螢幕閱讀。
-        """
-        response = model.generate_content(prompt)
-        analysis = response.text
-        
-        # 【修改】排版訊息，加入模型版本資訊
-        final_message = (
-            f"📈 【台股分析報告】\n"
-            f"目標標的：{ticker}\n"
-            f"AI 模型：{MODEL_VERSION}\n"
-            f"--------------------------\n"
-            f"{analysis}\n"
-            f"--------------------------\n"
-            f"⚠️ 投資請審慎評估風險"
-        )
-        
-        # LINE 推播
-        if LINE_TOKEN and USER_ID:
-            url = "https://api.line.me/v2/bot/message/push"
-            headers = {"Authorization": f"Bearer {LINE_TOKEN}", "Content-Type": "application/json"}
-            payload = {"to": USER_ID, "messages": [{"type": "text", "text": final_message}]}
-            requests.post(url, headers=headers, json=payload)
-            print("訊息已發送")
-        else:
-            print(final_message)
-            
-    except Exception as e:
-        print(f"執行錯誤: {e}")
-        sys.exit(1)
+    # AI 分析
+    prompt = f"""
+    你是一位專業財經分析師。請分別針對以下兩組市場數據提供簡短、專業的波段趨勢建議：
+    
+    【台股】
+    {tw_data}
+    
+    【美股】
+    {us_data}
+    
+    請注意：
+    1. 使用條列式重點排版。
+    2. 重要數據請加粗。
+    3. 內容需精簡，適合手機小螢幕閱讀。
+    """
+    
+    response = model.generate_content(prompt)
+    analysis = response.text
+    
+    # 訊息排版
+    final_message = (
+        f"📈 【市場投資分析報告】\n"
+        f"AI 模型：{MODEL_VERSION}\n"
+        f"--------------------------\n"
+        f"{analysis}\n"
+        f"--------------------------\n"
+        f"⚠️ 投資有風險，請審慎評估。"
+    )
+    
+    # 發送至 LINE
+    url = "https://api.line.me/v2/bot/message/push"
+    headers = {"Authorization": f"Bearer {LINE_TOKEN}", "Content-Type": "application/json"}
+    payload = {"to": USER_ID, "messages": [{"type": "text", "text": final_message}]}
+    requests.post(url, headers=headers, json=payload)
 
 if __name__ == "__main__":
     main()
