@@ -12,7 +12,7 @@ LINE_TOKEN = os.environ.get("LINE_TOKEN")
 USER_ID = os.environ.get("LINE_USER_ID")
 
 # 鎖定模型為 gemini-1.5-pro (對應 pro-latest)
-MODEL_VERSION = 'gemini-1.5-pro'
+MODEL_VERSION = 'gemini-3.5-flash'
 
 def get_technical_analysis(ticker_symbol):
     stock = yf.Ticker(ticker_symbol)
