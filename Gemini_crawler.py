@@ -11,8 +11,19 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 LINE_TOKEN = os.environ.get("LINE_TOKEN")
 USER_ID = os.environ.get("LINE_USER_ID")
 
-# 鎖定模型為 gemini-1.5-pro (對應 pro-latest)
-MODEL_VERSION = 'gemini-3.5-flash'
+def get_best_model():
+    """自動偵測目前 API 金鑰支援的正確模型名稱"""
+    genai.configure(api_key=GEMINI_API_KEY)
+    
+    # 搜尋所有支援 generateContent 的模型
+    for m in genai.list_models():
+        if 'generateContent' in m.supported_generation_methods:
+            # 優先使用 flash 版本，通常支援度最廣且符合免費額度限制
+            if 'flash' in m.name:
+                return m.name
+    
+    # 若找不到 flash，回傳第一個找到的可用模型
+    return genai.list_models()[0].name
 
 def get_technical_analysis(ticker_symbol):
     stock = yf.Ticker(ticker_symbol)
@@ -21,6 +32,7 @@ def get_technical_analysis(ticker_symbol):
     if df.empty:
         return None, None
 
+    # 計算技術指標
     df.ta.macd(append=True)
     df.ta.rsi(append=True)
     df.ta.bbands(append=True)
@@ -28,6 +40,7 @@ def get_technical_analysis(ticker_symbol):
     
     cols = df.columns
     try:
+        # 動態識別欄位名稱
         bbl_col = [c for c in cols if 'BBL' in c][0]
         bbu_col = [c for c in cols if 'BBU' in c][0]
         macd_col = [c for c in cols if 'MACD_' in c and 'MACDh' not in c and 'MACDs' not in c][0]
@@ -54,10 +67,12 @@ def get_technical_analysis(ticker_symbol):
 
 def main():
     if not GEMINI_API_KEY:
+        print("未設定 GEMINI_API_KEY")
         sys.exit(1)
         
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel(MODEL_VERSION)
+    model_name = get_best_model()
+    print(f"自動偵測並使用模型: {model_name}")
+    model = genai.GenerativeModel(model_name)
     
     tickers = ["2330.TW", "0050.TW", "NVDA", "AMD", "MU"]
     report = "📈 【AI 深度技術面波段報告】\n"
@@ -69,16 +84,20 @@ def main():
                 prompt = f"分析標的：{t}\n基本面：{fund}\n技術面指標：{tech}\n請提供波段買賣建議。"
                 response = model.generate_content(prompt)
                 report += f"\n--- {t} ---\n{response.text}\n"
-                # 關鍵修正：每次請求後暫停 15 秒以避開 429 配額錯誤
-                time.sleep(15) 
+                
+                # 強制暫停 15 秒，避免 429 配額錯誤
+                time.sleep(15)
         except Exception as e:
             report += f"\n{t} 分析失敗: {e}\n"
+            time.sleep(5)
 
     if LINE_TOKEN and USER_ID:
         url = "https://api.line.me/v2/bot/message/push"
         headers = {"Authorization": f"Bearer {LINE_TOKEN}", "Content-Type": "application/json"}
         payload = {"to": USER_ID, "messages": [{"type": "text", "text": report}]}
         requests.post(url, headers=headers, json=payload)
+    
+    print(report)
 
 if __name__ == "__main__":
     main()
