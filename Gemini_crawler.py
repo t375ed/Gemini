@@ -11,7 +11,7 @@ LINE_TOKEN = os.environ.get("LINE_TOKEN")
 USER_ID = os.environ.get("LINE_USER_ID")
 
 # 改用穩定版本名稱，解決 404 Not Found 問題
-MODEL_VERSION = 'gemini-1.5-flash'
+MODEL_VERSION = 'gemini-pro-latest'
 
 def get_technical_analysis(ticker_symbol):
     stock = yf.Ticker(ticker_symbol)
