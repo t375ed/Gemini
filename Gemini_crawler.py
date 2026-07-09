@@ -13,7 +13,7 @@ LINE_TOKEN = os.environ.get("LINE_TOKEN")
 USER_ID = os.environ.get("LINE_USER_ID")
 
 def get_best_model():
-    """自動偵測目前可用的模型"""
+    """【保留功能】自動偵測支援的模型，避免 404 錯誤"""
     genai.configure(api_key=GEMINI_API_KEY)
     for m in genai.list_models():
         if 'generateContent' in m.supported_generation_methods and 'flash' in m.name:
@@ -21,17 +21,15 @@ def get_best_model():
     return genai.list_models()[0].name
 
 def get_full_analysis(ticker_symbol):
-    """整合一年資料、技術指標、基本面與行情"""
+    """【保留功能】完整指標計算 (一年期)"""
     stock = yf.Ticker(ticker_symbol)
-    df = stock.history(period="1y") # 確保抓取一年歷史
+    df = stock.history(period="1y")
     if df.empty: return None, None, None, None, None
 
-    # 1. 時間戳記與行情
     latest_date = df.index[-1].strftime('%Y-%m-%d')
     latest = df.iloc[-1]
     price_info = f"收盤: {latest['Close']:.2f}, 最高: {latest['High']:.2f}, 最低: {latest['Low']:.2f}"
     
-    # 2. 技術指標計算 (全數依據一年數據)
     df.ta.macd(append=True); df.ta.rsi(append=True); df.ta.bbands(append=True); df.ta.stoch(append=True)
     try:
         bbl = [c for c in df.columns if 'BBL' in c][0]
@@ -46,36 +44,43 @@ def get_full_analysis(ticker_symbol):
     except:
         tech_summary = "指標計算中"
 
-    # 3. 基本面資料
     info = stock.info
     fund_summary = f"P/E: {info.get('trailingPE', 'N/A')}, P/B: {info.get('priceToBook', 'N/A')}"
-    
-    # 4. 參考資料來源
-    ref = f"數據來源: Yahoo Finance (統計截止: {latest_date})"
+    ref = f"資料來源: Yahoo Finance (截止: {latest_date})"
     
     return price_info, tech_summary, fund_summary, ref, latest_date
 
 def main():
     if not GEMINI_API_KEY: sys.exit(1)
     
-    # 動態取得模型名稱
+    # 【保留功能】自適應模型偵測
     model_name = get_best_model()
     model = genai.GenerativeModel(model_name)
     
     tickers = ["2330.TW", "0050.TW", "NVDA", "AMD", "MU"]
-    
-    report = f"📈 【完整 AI 財務技術報告】\n"
-    report += f"報告時間: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
-    report += f"引用模型: {model_name}\n"
+    report = f"📈 【Gemini AI 財務技術報告 Vesrsion 1.0.0】\n報告時間: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n引用模型: {model_name}\n"
     
     for t in tickers:
         try:
             price, tech, fund, ref, _ = get_full_analysis(t)
             if price:
                 prompt = f"分析標的：{t}\n參考資料：{ref}\n今日行情：{price}\n技術面：{tech}\n基本面：{fund}\n請根據以上資訊給出建議。"
-                response = model.generate_content(prompt)
-                report += f"\n--- {t} ---\n【{ref}】\n【行情】{price}\n【指標】{tech}\n【基本】{fund}\n【AI建議】{response.text}\n"
-                time.sleep(15) 
+                
+                # 【新增】防 429 錯誤的重試機制
+                success = False
+                for attempt in range(3):
+                    try:
+                        response = model.generate_content(prompt)
+                        report += f"\n--- {t} ---\n【{ref}】\n【行情】{price}\n【指標】{tech}\n【基本】{fund}\n【AI建議】{response.text}\n"
+                        success = True
+                        break
+                    except Exception as e:
+                        if "429" in str(e):
+                            time.sleep(60) # 等待 60 秒後重試
+                        else:
+                            raise e
+                if not success: report += f"\n{t} 分析因頻率限制失敗\n"
+                time.sleep(20) # 每個標的間隔 20 秒
         except Exception as e:
             report += f"\n{t} 分析失敗: {e}\n"
 
