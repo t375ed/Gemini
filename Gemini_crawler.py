@@ -9,8 +9,9 @@ import sys
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 LINE_TOKEN = os.environ.get("LINE_TOKEN")
 USER_ID = os.environ.get("LINE_USER_ID")
-# 使用您在 AI Studio 使用的模型名稱
-MODEL_VERSION = 'gemini-3.0-flash-preview'
+
+# 改用穩定版本名稱，解決 404 Not Found 問題
+MODEL_VERSION = 'gemini-1.5-flash'
 
 def get_technical_analysis(ticker_symbol):
     stock = yf.Ticker(ticker_symbol)
@@ -25,7 +26,7 @@ def get_technical_analysis(ticker_symbol):
     df.ta.bbands(append=True)
     df.ta.stoch(append=True)
     
-    # 動態識別欄位，解決 KeyError
+    # 動態識別欄位
     cols = df.columns
     try:
         bbl_col = [c for c in cols if 'BBL' in c][0]
@@ -58,9 +59,7 @@ def main():
         sys.exit(1)
         
     genai.configure(api_key=GEMINI_API_KEY)
-# 在 main 函數中加入這段來檢查目前可用的模型
-    models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_methods]
-    print(f"目前可用的模型: {models}")
+    model = genai.GenerativeModel(MODEL_VERSION)
     
     tickers = ["2330.TW", "0050.TW", "NVDA", "AMD", "MU"]
     report = "📈 【AI 深度技術面波段報告】\n"
