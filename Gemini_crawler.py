@@ -9,7 +9,8 @@ import sys
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 LINE_TOKEN = os.environ.get("LINE_TOKEN")
 USER_ID = os.environ.get("LINE_USER_ID")
-MODEL_VERSION = 'gemini-1.5-flash' # 已更新為較新的推薦模型版本
+# 使用您在 AI Studio 使用的模型名稱
+MODEL_VERSION = 'gemini-3.0-flash-preview'
 
 def get_technical_analysis(ticker_symbol):
     stock = yf.Ticker(ticker_symbol)
@@ -24,25 +25,28 @@ def get_technical_analysis(ticker_symbol):
     df.ta.bbands(append=True)
     df.ta.stoch(append=True)
     
-    # 【動態識別欄位，解決 KeyError】
+    # 動態識別欄位，解決 KeyError
     cols = df.columns
-    bbl_col = [c for c in cols if 'BBL' in c][0]
-    bbu_col = [c for c in cols if 'BBU' in c][0]
-    macd_col = [c for c in cols if 'MACD_' in c and 'MACDh' not in c and 'MACDs' not in c][0]
-    stoch_k = [c for c in cols if 'STOCHk' in c][0]
-    stoch_d = [c for c in cols if 'STOCHd' in c][0]
-    rsi_col = [c for c in cols if 'RSI' in c][0]
-    
-    # 計算 %B
-    df['PCT_B'] = (df['Close'] - df[bbl_col]) / (df[bbu_col] - df[bbl_col])
-    
-    latest = df.iloc[-1]
-    tech_summary = (
-        f"RSI: {latest[rsi_col]:.2f}, "
-        f"MACD: {latest[macd_col]:.2f}, "
-        f"KD(K/D): {latest[stoch_k]:.2f}/{latest[stoch_d]:.2f}, "
-        f"%B: {latest['PCT_B']:.2f}"
-    )
+    try:
+        bbl_col = [c for c in cols if 'BBL' in c][0]
+        bbu_col = [c for c in cols if 'BBU' in c][0]
+        macd_col = [c for c in cols if 'MACD_' in c and 'MACDh' not in c and 'MACDs' not in c][0]
+        stoch_k = [c for c in cols if 'STOCHk' in c][0]
+        stoch_d = [c for c in cols if 'STOCHd' in c][0]
+        rsi_col = [c for c in cols if 'RSI' in c][0]
+        
+        # 計算 %B
+        df['PCT_B'] = (df['Close'] - df[bbl_col]) / (df[bbu_col] - df[bbl_col])
+        latest = df.iloc[-1]
+        
+        tech_summary = (
+            f"RSI: {latest[rsi_col]:.2f}, "
+            f"MACD: {latest[macd_col]:.2f}, "
+            f"KD(K/D): {latest[stoch_k]:.2f}/{latest[stoch_d]:.2f}, "
+            f"%B: {latest['PCT_B']:.2f}"
+        )
+    except Exception as e:
+        return f"指標計算錯誤: {e}", "N/A"
     
     info = stock.info
     fundamentals = f"P/E: {info.get('trailingPE', 'N/A')}, P/B: {info.get('priceToBook', 'N/A')}, ROE: {info.get('returnOnEquity', 'N/A')}"
