@@ -58,7 +58,9 @@ def main():
         sys.exit(1)
         
     genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel(MODEL_VERSION)
+# 在 main 函數中加入這段來檢查目前可用的模型
+    models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_methods]
+    print(f"目前可用的模型: {models}")
     
     tickers = ["2330.TW", "0050.TW", "NVDA", "AMD", "MU"]
     report = "📈 【AI 深度技術面波段報告】\n"
