@@ -4,14 +4,15 @@ import pandas_ta as ta
 import google.generativeai as genai
 import requests
 import sys
+import time
 
 # 設定環境變數
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 LINE_TOKEN = os.environ.get("LINE_TOKEN")
 USER_ID = os.environ.get("LINE_USER_ID")
 
-# 改用穩定版本名稱，解決 404 Not Found 問題
-MODEL_VERSION = 'gemini-pro-latest'
+# 鎖定模型為 gemini-1.5-pro (對應 pro-latest)
+MODEL_VERSION = 'gemini-1.5-pro'
 
 def get_technical_analysis(ticker_symbol):
     stock = yf.Ticker(ticker_symbol)
@@ -20,13 +21,11 @@ def get_technical_analysis(ticker_symbol):
     if df.empty:
         return None, None
 
-    # 計算技術指標
     df.ta.macd(append=True)
     df.ta.rsi(append=True)
     df.ta.bbands(append=True)
     df.ta.stoch(append=True)
     
-    # 動態識別欄位
     cols = df.columns
     try:
         bbl_col = [c for c in cols if 'BBL' in c][0]
@@ -36,7 +35,6 @@ def get_technical_analysis(ticker_symbol):
         stoch_d = [c for c in cols if 'STOCHd' in c][0]
         rsi_col = [c for c in cols if 'RSI' in c][0]
         
-        # 計算 %B
         df['PCT_B'] = (df['Close'] - df[bbl_col]) / (df[bbu_col] - df[bbl_col])
         latest = df.iloc[-1]
         
@@ -68,30 +66,19 @@ def main():
         try:
             tech, fund = get_technical_analysis(t)
             if tech:
-                prompt = f"""
-                分析標的：{t} (時間週期：過去一年)
-                基本面：{fund}
-                技術面指標：{tech}
-                
-                請根據以上 1 年期技術指標與基本面資料，分析目前的波段趨勢：
-                1. MACD 與 KD 是否出現黃金/死亡交叉？
-                2. 目前 RSI 與 %B 是否顯示超買或超賣？
-                3. 提供專業的波段買賣建議。
-                
-                格式要求：請使用條列式，內容精簡適合手機閱讀。
-                """
+                prompt = f"分析標的：{t}\n基本面：{fund}\n技術面指標：{tech}\n請提供波段買賣建議。"
                 response = model.generate_content(prompt)
                 report += f"\n--- {t} ---\n{response.text}\n"
+                # 關鍵修正：每次請求後暫停 15 秒以避開 429 配額錯誤
+                time.sleep(15) 
         except Exception as e:
             report += f"\n{t} 分析失敗: {e}\n"
 
-    # 發送 LINE
     if LINE_TOKEN and USER_ID:
         url = "https://api.line.me/v2/bot/message/push"
         headers = {"Authorization": f"Bearer {LINE_TOKEN}", "Content-Type": "application/json"}
         payload = {"to": USER_ID, "messages": [{"type": "text", "text": report}]}
         requests.post(url, headers=headers, json=payload)
-    print(report)
 
 if __name__ == "__main__":
     main()
