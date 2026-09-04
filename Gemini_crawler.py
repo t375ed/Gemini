@@ -102,11 +102,12 @@ def get_full_analysis(ticker_symbol):
 
 def generate_ai_analysis(client, prompt):
     """
-    具備退避重試機制與備用模型降級的 Gemini 呼叫函式
-    使用官方相容性最佳的模型名稱清單
+    修正後的 AI 呼叫邏輯：完整捕捉錯誤並確保備用模型切換
     """
+    # 官方正則模型名稱
     models_to_try = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
     
+    last_error_msg = ""
     for model_name in models_to_try:
         for attempt in range(3):
             try:
@@ -114,22 +115,21 @@ def generate_ai_analysis(client, prompt):
                     model=model_name,
                     contents=prompt
                 )
-                return response.text.strip(), model_name
+                if response.text:
+                    return response.text.strip(), model_name
             except Exception as e:
                 err_msg = str(e)
-                # 遇到 503 (UNAVAILABLE) 或 429 (限流) 進行等待重試
-                if "503" in err_msg or "UNAVAILABLE" in err_msg or "429" in err_msg:
-                    wait_time = (attempt + 1) * 5
-                    print(f"[{model_name}] 伺服器繁忙 (嘗試 {attempt + 1}/3)，等待 {wait_time} 秒後重試...")
-                    time.sleep(wait_time)
-                elif "404" in err_msg or "NOT_FOUND" in err_msg:
-                    print(f"[{model_name}] 模型不可用，自動切換至下一備用模型...")
-                    break  # 切換到下一個 model_name
+                last_error_msg = err_msg
+                print(f"[{model_name}] 呼叫失敗 (嘗試 {attempt + 1}/3): {err_msg[:80]}")
+                
+                # 遇到流量限制 (503 / 429) 稍作等待再試
+                if "503" in err_msg or "429" in err_msg or "UNAVAILABLE" in err_msg:
+                    time.sleep((attempt + 1) * 3)
                 else:
-                    print(f"[{model_name}] 發生未預期錯誤: {e}")
+                    # 404 或其他錯誤，跳出當前模型的 retry，直接切換下一個模型
                     break
                     
-    return "AI 分析因伺服器繁忙或模型無法調用而失敗", "失敗"
+    return f"AI 分析失敗 (原因: {last_error_msg[:100]})", "失敗"
 
 def main():
     if not GEMINI_API_KEY: 
