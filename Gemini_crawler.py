@@ -102,34 +102,51 @@ def get_full_analysis(ticker_symbol):
 
 def generate_ai_analysis(client, prompt):
     """
-    修正後的 AI 呼叫邏輯：完整捕捉錯誤並確保備用模型切換
+    完善的備用模型降級與退避重試機制
+    優先使用 gemini-2.5-flash，繁忙時重試，失敗則自動切換至備用模型 gemini-2.5-pro
+    回傳值：(分析文字結果, 實際使用的模型 VERSION)
     """
-    # 官方正則模型名稱
-    models_to_try = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+    # 定義主模型與備用模型清單 (均為新版 SDK 相容之名稱)
+    PRIMARY_MODEL = "gemini-2.5-flash"
+    BACKUP_MODEL = "gemini-2.5-pro"
     
-    last_error_msg = ""
-    for model_name in models_to_try:
+    models_queue = [PRIMARY_MODEL, BACKUP_MODEL]
+    last_error = ""
+
+    for model_name in models_queue:
+        # 對每個模型最多嘗試 3 次 (因應 429 / 503 流量管制)
         for attempt in range(3):
             try:
+                print(f"嘗試使用模型 [{model_name}] 進行分析 (第 {attempt + 1} 次)...")
                 response = client.models.generate_content(
                     model=model_name,
                     contents=prompt
                 )
                 if response.text:
-                    return response.text.strip(), model_name
+                    # 成功產出，回傳結果與使用的模型名稱
+                    is_backup = (model_name != PRIMARY_MODEL)
+                    version_tag = f"{model_name} [備用模型]" if is_backup else model_name
+                    return response.text.strip(), version_tag
             except Exception as e:
                 err_msg = str(e)
-                last_error_msg = err_msg
-                print(f"[{model_name}] 呼叫失敗 (嘗試 {attempt + 1}/3): {err_msg[:80]}")
+                last_error = err_msg
+                print(f"[{model_name}] 失敗: {err_msg[:100]}")
                 
-                # 遇到流量限制 (503 / 429) 稍作等待再試
-                if "503" in err_msg or "429" in err_msg or "UNAVAILABLE" in err_msg:
-                    time.sleep((attempt + 1) * 3)
-                else:
-                    # 404 或其他錯誤，跳出當前模型的 retry，直接切換下一個模型
+                # 如果是 404 (模型不存在)，直接跳出重試，切換下一個模型
+                if "404" in err_msg or "NOT_FOUND" in err_msg:
+                    print(f"[{model_name}] 無法找到此模型，準備切換至備用模型...")
                     break
-                    
-    return f"AI 分析失敗 (原因: {last_error_msg[:100]})", "失敗"
+                
+                # 如果是 503 / 429 流量問題，等待後重試
+                if "503" in err_msg or "429" in err_msg or "UNAVAILABLE" in err_msg:
+                    sleep_sec = (attempt + 1) * 4
+                    print(f"[{model_name}] 伺服器繁忙，等待 {sleep_sec} 秒後重試...")
+                    time.sleep(sleep_sec)
+                else:
+                    # 其他未預期錯誤，直接切換備用模型
+                    break
+
+    return f"AI 分析失敗 (原因: {last_error[:100]})", "失敗"
 
 def main():
     if not GEMINI_API_KEY: 
@@ -139,7 +156,7 @@ def main():
     client = genai.Client(api_key=GEMINI_API_KEY)
     
     tickers = ["2330.TW", "0050.TW", "NVDA", "AMD", "MU"]
-    report = f"📈 【Gemini AI 財務技術報告 Version 1.0.6】\n報告時間: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+    report = f"📈 【Gemini AI 財務技術報告 Version 1.0.8】\n報告時間: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
     
     for t in tickers:
         try:
@@ -152,15 +169,16 @@ def main():
 技術面：{tech}
 基本面：{fund}
 
-請扮演專業投資分析師，針對上述數據給出分析建議。
+請扮演客觀且嚴謹的資深投資分析師，結合技術面指標與基本面資料給出投資建議。
 【硬性要求】：
 1. 分析內容請維持重點精煉，字數嚴格限制在 300 字以內。
 2. 切勿包含任何開場白或問候語，直接輸出重點結論與操作建議。
 """
-                ai_advice, used_model = generate_ai_analysis(client, prompt)
-                report += f"\n--- {t} ---\n【行情】{price}\n【指標】{tech}\n【基本】{fund}\n【AI建議 ({used_model})】\n{ai_advice}\n"
+                ai_advice, used_version = generate_ai_analysis(client, prompt)
+                report += f"\n--- {t} ---\n【行情】{price}\n【指標】{tech}\n【基本】{fund}\n【AI建議 ({used_version})】\n{ai_advice}\n"
                 
-                time.sleep(5)
+                # 每個標的隔 6 秒，降低觸發 API 流量上限的機率
+                time.sleep(6)
             else:
                 report += f"\n--- {t} ---\n⚠️ 無法取得該標的之有效行情資料\n"
         except Exception as e:
@@ -169,7 +187,7 @@ def main():
     # 安全裁切，確保最終 LINE 訊息不超過官方上限 4,000 字
     final_report = report[:3500] + "\n...(報告已截斷)" if len(report) > 3500 else report
 
-    # 發送邏輯
+    # LINE 發送邏輯
     if LINE_TOKEN and USER_ID:
         payload = {"to": USER_ID, "messages": [{"type": "text", "text": final_report}]}
         headers = {"Authorization": f"Bearer {LINE_TOKEN}", "Content-Type": "application/json"}
@@ -178,5 +196,7 @@ def main():
     
     print(final_report)
 
+if __name__ == "__main__":
+    main()
 if __name__ == "__main__":
     main()
