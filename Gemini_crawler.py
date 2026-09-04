@@ -53,45 +53,58 @@ def get_full_analysis(ticker_symbol):
 def main():
     if not GEMINI_API_KEY: sys.exit(1)
     
-    # 【保留功能】自適應模型偵測
     model_name = get_best_model()
     model = genai.GenerativeModel(model_name)
     
     tickers = ["2330.TW", "0050.TW", "NVDA", "AMD", "MU"]
-    report = f"📈 【Gemini AI 財務技術報告 Vesrsion 1.0.0】\n報告時間: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n引用模型: {model_name}\n"
+    report = f"📈 【Gemini AI 財務技術報告 Version 1.0.0】\n報告時間: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n引用模型: {model_name}\n"
     
     for t in tickers:
         try:
             price, tech, fund, ref, _ = get_full_analysis(t)
             if price:
-                prompt = f"分析標的：{t}\n參考資料：{ref}\n今日行情：{price}\n技術面：{tech}\n基本面：{fund}\n請根據以上資訊給出建議。"
+                # 【調整】加入字數約束與精簡格式要求的 Prompt
+                prompt = f"""
+分析標的：{t}
+參考資料：{ref}
+今日行情：{price}
+技術面：{tech}
+基本面：{fund}
+
+請扮演專業投資分析師，針對上述數據給出分析建議。
+【硬性要求】：
+1. 分析內容請維持重點精煉，字數嚴格限制在 300 字以內。
+2. 切勿包含任何開場白或問候語，直接輸出重點結論與操作建議。
+"""
                 
-                # 【新增】防 429 錯誤的重試機制
                 success = False
                 for attempt in range(3):
                     try:
                         response = model.generate_content(prompt)
-                        report += f"\n--- {t} ---\n【{ref}】\n【行情】{price}\n【指標】{tech}\n【基本】{fund}\n【AI建議】{response.text}\n"
+                        report += f"\n--- {t} ---\n【行情】{price}\n【指標】{tech}\n【基本】{fund}\n【AI建議】\n{response.text.strip()}\n"
                         success = True
                         break
                     except Exception as e:
                         if "429" in str(e):
-                            time.sleep(60) # 等待 60 秒後重試
+                            time.sleep(60)
                         else:
                             raise e
                 if not success: report += f"\n{t} 分析因頻率限制失敗\n"
-                time.sleep(20) # 每個標的間隔 20 秒
+                time.sleep(20)
         except Exception as e:
             report += f"\n{t} 分析失敗: {e}\n"
 
+    # 安全裁切，確保最終 LINE 訊息不超過官方上限 4,000 字
+    final_report = report[:3500] + "\n...(報告已截斷)" if len(report) > 3500 else report
+
     # 發送邏輯
     if LINE_TOKEN and USER_ID:
-        payload = {"to": USER_ID, "messages": [{"type": "text", "text": report[:4000]}]}
+        payload = {"to": USER_ID, "messages": [{"type": "text", "text": final_report}]}
         headers = {"Authorization": f"Bearer {LINE_TOKEN}", "Content-Type": "application/json"}
         res = requests.post("https://api.line.me/v2/bot/message/push", headers=headers, json=payload)
         print(f"LINE 發送狀態: {res.status_code}")
     
-    print(report)
+    print(final_report)
 
 if __name__ == "__main__":
     main()
