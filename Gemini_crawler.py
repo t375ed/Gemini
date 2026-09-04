@@ -1,22 +1,18 @@
 import os
 import requests
-from requests import Session
 import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
 import google.generativeai as genai
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
+import twstock
 
 # 設定環境變數
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 LINE_TOKEN = os.environ.get("LINE_TOKEN")
 USER_ID = os.environ.get("LINE_USER_ID")
-
-# 建立自定義 Session 並帶入 User-Agent，解決 Yahoo Finance 阻擋導致 nan 的問題
-session = Session()
-session.headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 
 def get_best_model():
     """自動偵測支援的模型，避免 404 錯誤"""
@@ -26,25 +22,54 @@ def get_best_model():
             return m.name
     return genai.list_models()[0].name
 
-def get_full_analysis(ticker_symbol):
-    """完整指標計算 (一年期) - 帶入 session 防護"""
-    stock = yf.Ticker(ticker_symbol, session=session)
-    df = stock.history(period="1y")
-    
-    # 檢查是否抓得到資料或全為空值
-    if df.empty or df['Close'].isnull().all(): 
-        return None, None, None, None, None
+def fetch_stock_df(ticker_symbol):
+    """
+    根據標的自動切換抓取來源：
+    - 台股 (.TW / .TWO) 使用 twstock
+    - 美股 使用 yfinance
+    """
+    try:
+        if ".TW" in ticker_symbol or ".TWO" in ticker_symbol:
+            code = ticker_symbol.replace(".TW", "").replace(".TWO", "")
+            stock = twstock.Stock(code)
+            # 抓取最近的歷史資料
+            raw_data = stock.fetch_31()
+            if not raw_data:
+                return None, None
+            
+            df = pd.DataFrame(raw_data)
+            df.rename(columns={
+                'date': 'Date', 'open': 'Open', 'high': 'High',
+                'low': 'Low', 'close': 'Close', 'capacity': 'Volume'
+            }, inplace=True)
+            df.set_index('Date', inplace=True)
+            latest_date = df.index[-1].strftime('%Y-%m-%d')
+            ref = f"資料來源: 臺灣證券交易所/櫃買中心 (截止: {latest_date})"
+            return df, ref
+        else:
+            stock = yf.Ticker(ticker_symbol)
+            df = stock.history(period="1y")
+            if df.empty or df['Close'].isnull().all():
+                return None, None
+            latest_date = df.index[-1].strftime('%Y-%m-%d')
+            ref = f"資料來源: Yahoo Finance (截止: {latest_date})"
+            return df, ref
+    except Exception as e:
+        print(f"抓取 {ticker_symbol} 失敗: {e}")
+        return None, None
 
-    latest_date = df.index[-1].strftime('%Y-%m-%d')
+def get_full_analysis(ticker_symbol):
+    """完整指標計算與基本面整理"""
+    df, ref = fetch_stock_df(ticker_symbol)
+    
+    if df is None or df.empty or len(df) < 10: 
+        return None, None, None, None
+
     latest = df.iloc[-1]
+    close_val = latest['Close']
+    high_val = latest['High']
+    low_val = latest['Low']
     
-    close_val = latest.get('Close', float('nan'))
-    high_val = latest.get('High', float('nan'))
-    low_val = latest.get('Low', float('nan'))
-    
-    if pd.isna(close_val):
-        return None, None, None, None, None
-        
     price_info = f"收盤: {close_val:.2f}, 最高: {high_val:.2f}, 最低: {low_val:.2f}"
     
     # 計算技術指標
@@ -65,32 +90,35 @@ def get_full_analysis(ticker_symbol):
         latest_vals = df.iloc[-1]
         
         tech_summary = f"RSI: {latest_vals.get(rsi, 0):.2f}, MACD: {latest_vals.get(macd, 0):.2f}, KD: {latest_vals.get(sk, 0):.2f}/{latest_vals.get(sd, 0):.2f}, %B: {latest_vals.get('PCT_B', 0):.2f}"
-    except Exception:
+    except Exception as e:
         tech_summary = "指標計算中"
 
-    # 抓取基本面資料防錯
-    try:
-        info = stock.info
-        fund_summary = f"P/E: {info.get('trailingPE', 'N/A')}, P/B: {info.get('priceToBook', 'N/A')}"
-    except Exception:
-        fund_summary = "P/E: N/A, P/B: N/A"
-        
-    ref = f"資料來源: Yahoo Finance (截止: {latest_date})"
-    
-    return price_info, tech_summary, fund_summary, ref, latest_date
+    # 基本面數據 (美股用 yfinance，台股顯示基礎資訊)
+    if ".TW" in ticker_symbol or ".TWO" in ticker_symbol:
+        fund_summary = "P/E: 參考公開資訊觀測站"
+    else:
+        try:
+            info = yf.Ticker(ticker_symbol).info
+            fund_summary = f"P/E: {info.get('trailingPE', 'N/A')}, P/B: {info.get('priceToBook', 'N/A')}"
+        except Exception:
+            fund_summary = "P/E: N/A, P/B: N/A"
+            
+    return price_info, tech_summary, fund_summary, ref
 
 def main():
-    if not GEMINI_API_KEY: sys.exit(1)
+    if not GEMINI_API_KEY: 
+        print("未設定 GEMINI_API_KEY")
+        sys.exit(1)
     
     model_name = get_best_model()
     model = genai.GenerativeModel(model_name)
     
     tickers = ["2330.TW", "0050.TW", "NVDA", "AMD", "MU"]
-    report = f"📈 【Gemini AI 財務技術報告 Version 1.0.1】\n報告時間: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n引用模型: {model_name}\n"
+    report = f"📈 【Gemini AI 財務技術報告 Version 1.0.2】\n報告時間: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n引用模型: {model_name}\n"
     
     for t in tickers:
         try:
-            price, tech, fund, ref, _ = get_full_analysis(t)
+            price, tech, fund, ref = get_full_analysis(t)
             if price:
                 prompt = f"""
 分析標的：{t}
@@ -123,7 +151,7 @@ def main():
                         else:
                             raise e
                 if not success: report += f"\n{t} 分析因頻率限制失敗\n"
-                time.sleep(20)
+                time.sleep(15)
             else:
                 report += f"\n--- {t} ---\n⚠️ 無法取得該標的之有效行情資料\n"
         except Exception as e:
