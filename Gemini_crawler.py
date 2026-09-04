@@ -102,48 +102,39 @@ def get_full_analysis(ticker_symbol):
 
 def generate_ai_analysis(client, prompt):
     """
-    完善的備用模型降級與退避重試機制
-    優先使用 gemini-2.5-flash，繁忙時重試，失敗則自動切換至備用模型 gemini-2.5-pro
-    回傳值：(分析文字結果, 實際使用的模型 VERSION)
+    正確的模型降級邏輯：
+    1. 主模型：gemini-2.5-flash
+    2. 備用模型：gemini-1.5-pro (官方存在且正確的 ID)
     """
-    # 定義主模型與備用模型清單 (均為新版 SDK 相容之名稱)
     PRIMARY_MODEL = "gemini-2.5-flash"
-    BACKUP_MODEL = "gemini-2.5-pro"
+    BACKUP_MODEL = "gemini-1.5-pro"
     
     models_queue = [PRIMARY_MODEL, BACKUP_MODEL]
     last_error = ""
 
     for model_name in models_queue:
-        # 對每個模型最多嘗試 3 次 (因應 429 / 503 流量管制)
         for attempt in range(3):
             try:
-                print(f"嘗試使用模型 [{model_name}] 進行分析 (第 {attempt + 1} 次)...")
                 response = client.models.generate_content(
                     model=model_name,
                     contents=prompt
                 )
                 if response.text:
-                    # 成功產出，回傳結果與使用的模型名稱
                     is_backup = (model_name != PRIMARY_MODEL)
                     version_tag = f"{model_name} [備用模型]" if is_backup else model_name
                     return response.text.strip(), version_tag
             except Exception as e:
                 err_msg = str(e)
                 last_error = err_msg
-                print(f"[{model_name}] 失敗: {err_msg[:100]}")
                 
-                # 如果是 404 (模型不存在)，直接跳出重試，切換下一個模型
+                # 若遇到 404/NOT_FOUND，代表該 model ID 不存在，直接跳出換下一個 model
                 if "404" in err_msg or "NOT_FOUND" in err_msg:
-                    print(f"[{model_name}] 無法找到此模型，準備切換至備用模型...")
                     break
                 
-                # 如果是 503 / 429 流量問題，等待後重試
+                # 若遇到 503/429 流量限流，退避等待後重試
                 if "503" in err_msg or "429" in err_msg or "UNAVAILABLE" in err_msg:
-                    sleep_sec = (attempt + 1) * 4
-                    print(f"[{model_name}] 伺服器繁忙，等待 {sleep_sec} 秒後重試...")
-                    time.sleep(sleep_sec)
+                    time.sleep((attempt + 1) * 6)
                 else:
-                    # 其他未預期錯誤，直接切換備用模型
                     break
 
     return f"AI 分析失敗 (原因: {last_error[:100]})", "失敗"
