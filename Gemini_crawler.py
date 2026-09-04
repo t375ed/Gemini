@@ -1,7 +1,7 @@
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import requests
 import pandas as pd
 import pandas_ta as ta
@@ -17,14 +17,17 @@ USER_ID = os.environ.get("LINE_USER_ID")
 def fetch_stock_df(ticker_symbol):
     """
     根據標的自動切換抓取來源：
-    - 台股 (.TW / .TWO) 使用 twstock (繞過 Yahoo 封鎖)
+    - 台股 (.TW / .TWO) 使用 twstock (抓取近 60 天資料以足夠計算技術指標)
     - 美股 使用 yfinance
     """
     try:
         if ".TW" in ticker_symbol or ".TWO" in ticker_symbol:
             code = ticker_symbol.replace(".TW", "").replace(".TWO", "")
             stock = twstock.Stock(code)
-            raw_data = stock.fetch_31()
+            
+            # 計算約兩個月前（60 天）的年份與月份，確保有足夠 K 線計算 MACD/KD
+            start_date = datetime.now() - timedelta(days=60)
+            raw_data = stock.fetch_from(start_date.year, start_date.month)
             if not raw_data:
                 return None, None
             
@@ -53,7 +56,7 @@ def get_full_analysis(ticker_symbol):
     """完整指標計算與基本面整理"""
     df, ref = fetch_stock_df(ticker_symbol)
     
-    if df is None or df.empty or len(df) < 10: 
+    if df is None or df.empty or len(df) < 15: 
         return None, None, None, None
 
     latest = df.iloc[-1]
@@ -81,7 +84,8 @@ def get_full_analysis(ticker_symbol):
         latest_vals = df.iloc[-1]
         
         tech_summary = f"RSI: {latest_vals.get(rsi, 0):.2f}, MACD: {latest_vals.get(macd, 0):.2f}, KD: {latest_vals.get(sk, 0):.2f}/{latest_vals.get(sd, 0):.2f}, %B: {latest_vals.get('PCT_B', 0):.2f}"
-    except Exception:
+    except Exception as e:
+        print(f"{ticker_symbol} 技術指標計算錯誤: {e}")
         tech_summary = "指標計算中"
 
     # 基本面數據
@@ -98,14 +102,12 @@ def get_full_analysis(ticker_symbol):
 
 def generate_ai_analysis(client, prompt):
     """
-    具備指數退避重試機制與備用模型降級的 Gemini 呼叫函式
-    回傳值：(分析文字結果, 實際使用的模型名稱)
+    具備退避重試機制與備用模型降級的 Gemini 呼叫函式
+    使用官方相容性最佳的模型名稱清單
     """
-    # 優先選擇 gemini-2.5-flash，若持續繁忙則備用降級至 gemini-1.5-flash
-    models_to_try = ["gemini-2.5-flash", "gemini-1.5-flash"]
+    models_to_try = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
     
     for model_name in models_to_try:
-        # 對單一模型嘗試最多 3 次
         for attempt in range(3):
             try:
                 response = client.models.generate_content(
@@ -115,16 +117,19 @@ def generate_ai_analysis(client, prompt):
                 return response.text.strip(), model_name
             except Exception as e:
                 err_msg = str(e)
-                # 針對 503 (UNAVAILABLE) 或 429 (限流) 進行等待與重試
+                # 遇到 503 (UNAVAILABLE) 或 429 (限流) 進行等待重試
                 if "503" in err_msg or "UNAVAILABLE" in err_msg or "429" in err_msg:
                     wait_time = (attempt + 1) * 5
                     print(f"[{model_name}] 伺服器繁忙 (嘗試 {attempt + 1}/3)，等待 {wait_time} 秒後重試...")
                     time.sleep(wait_time)
+                elif "404" in err_msg or "NOT_FOUND" in err_msg:
+                    print(f"[{model_name}] 模型不可用，自動切換至下一備用模型...")
+                    break  # 切換到下一個 model_name
                 else:
-                    # 其他非流量相關的錯誤直接拋出
-                    raise e
+                    print(f"[{model_name}] 發生未預期錯誤: {e}")
+                    break
                     
-    return "AI 分析因伺服器持續繁忙，多次重試後失敗", "無 (模型全數忙碌)"
+    return "AI 分析因伺服器繁忙或模型無法調用而失敗", "失敗"
 
 def main():
     if not GEMINI_API_KEY: 
@@ -134,7 +139,7 @@ def main():
     client = genai.Client(api_key=GEMINI_API_KEY)
     
     tickers = ["2330.TW", "0050.TW", "NVDA", "AMD", "MU"]
-    report = f"📈 【Gemini AI 財務技術報告 Version 1.0.5】\n報告時間: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+    report = f"📈 【Gemini AI 財務技術報告 Version 1.0.6】\n報告時間: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
     
     for t in tickers:
         try:
@@ -152,13 +157,9 @@ def main():
 1. 分析內容請維持重點精煉，字數嚴格限制在 300 字以內。
 2. 切勿包含任何開場白或問候語，直接輸出重點結論與操作建議。
 """
-                # 呼叫自動重試與降級機制
                 ai_advice, used_model = generate_ai_analysis(client, prompt)
-                
-                # 組合報告內容並註明該標的採用的 AI 模型版本
                 report += f"\n--- {t} ---\n【行情】{price}\n【指標】{tech}\n【基本】{fund}\n【AI建議 ({used_model})】\n{ai_advice}\n"
                 
-                # 每個標的請求之間間隔 5 秒，防止過於頻繁引發 429/503
                 time.sleep(5)
             else:
                 report += f"\n--- {t} ---\n⚠️ 無法取得該標的之有效行情資料\n"
@@ -168,7 +169,7 @@ def main():
     # 安全裁切，確保最終 LINE 訊息不超過官方上限 4,000 字
     final_report = report[:3500] + "\n...(報告已截斷)" if len(report) > 3500 else report
 
-    # LINE 推播發送邏輯
+    # 發送邏輯
     if LINE_TOKEN and USER_ID:
         payload = {"to": USER_ID, "messages": [{"type": "text", "text": final_report}]}
         headers = {"Authorization": f"Bearer {LINE_TOKEN}", "Content-Type": "application/json"}
