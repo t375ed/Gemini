@@ -1,11 +1,13 @@
 import os
 import json
+import time
 from urllib.parse import quote_plus
 import feedparser
 import pandas as pd
 from bs4 import BeautifulSoup
 from google import genai
 from google.genai import types
+from google.genai.errors import ServerError, ClientError
 from linebot.v3.messaging import Configuration, ApiClient, MessagingApi, PushMessageRequest, TextMessage
 
 # 取得環境變數（支援 LINE_TOKEN 與 LINE_CHANNEL_ACCESS_TOKEN 相容性）
@@ -20,7 +22,7 @@ def fetch_google_news(query: str, max_items: int = 10) -> pd.DataFrame:
     q = quote_plus(query)
     url = f"https://news.google.com/rss/search?q={q}&hl=zh-Hant&gl=TW&ceid=TW:zh-Hant"
     feed = feedparser.parse(url)
-    
+
     rows = []
     for entry in feed.entries[:max_items]:
         raw_summary = entry.get("summary", "")
@@ -31,6 +33,37 @@ def fetch_google_news(query: str, max_items: int = 10) -> pd.DataFrame:
             "link": entry.get("link", "")
         })
     return pd.DataFrame(rows)
+
+def call_gemini_with_retry(prompt: str, config, max_retries: int = 5, base_delay: float = 5.0):
+    """
+    呼叫 Gemini API,遇到 503 (伺服器過載) 或其他暫時性錯誤時自動重試,
+    採用指數退避 (exponential backoff)。
+    """
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+                config=config
+            )
+            return response
+        except ServerError as e:
+            # 503 UNAVAILABLE、500 等伺服器端暫時性錯誤,值得重試
+            last_error = e
+            wait_time = base_delay * (2 ** (attempt - 1))  # 5s, 10s, 20s, 40s...
+            print(f"[警告] Gemini 伺服器錯誤 (第 {attempt}/{max_retries} 次嘗試): {e}")
+            if attempt < max_retries:
+                print(f"[重試] 等待 {wait_time:.0f} 秒後重試...")
+                time.sleep(wait_time)
+        except ClientError as e:
+            # 4xx 通常是請求本身有問題 (如 API Key 錯誤、request 格式錯誤),重試沒有意義
+            print(f"[錯誤] Gemini 用戶端錯誤,不重試: {e}")
+            raise
+
+    # 所有重試都失敗
+    print(f"[失敗] 已重試 {max_retries} 次仍失敗,放棄本次分析。")
+    raise last_error
 
 def analyze_investment_news(headlines: list[str], summaries: list[str]) -> list[dict]:
     """評估閱讀等級與情緒，並針對 4 星以上新聞進行簡短精準的 6 大投資問題解析。"""
@@ -91,11 +124,7 @@ def analyze_investment_news(headlines: list[str], summaries: list[str]) -> list[
         }
     )
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
-        config=config
-    )
+    response = call_gemini_with_retry(prompt, config)
     return json.loads(response.text)
 
 def send_line_push(message_text: str):
@@ -112,12 +141,19 @@ def send_line_push(message_text: str):
 def main():
     keyword = "台積電"
     df = fetch_google_news(keyword, max_items=10)
-    
+
     if df.empty:
         print("未抓取到新聞")
         return
 
-    results = analyze_investment_news(df["title"].tolist(), df["summary"].tolist())
+    try:
+        results = analyze_investment_news(df["title"].tolist(), df["summary"].tolist())
+    except Exception as e:
+        # Gemini 重試多次後仍失敗,記錄錯誤但不讓整個 workflow crash 成紅色
+        # (若希望 workflow 仍顯示失敗以利追蹤,可將下面這行改回 raise)
+        print(f"[致命錯誤] Gemini 分析失敗,本次跳過推播: {e}")
+        return
+
     df_res = pd.DataFrame(results)
     df_final = pd.concat([df, df_res], axis=1)
 
