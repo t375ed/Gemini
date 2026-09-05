@@ -1,193 +1,244 @@
 import os
-import json
+import sys
 import time
-from urllib.parse import quote_plus
-import feedparser
+from datetime import datetime, timedelta
+import requests
 import pandas as pd
-from bs4 import BeautifulSoup
+import pandas_ta as ta
+import twstock
+import yfinance as yf
 from google import genai
 from google.genai import types
-from google.genai.errors import ServerError, ClientError
-from linebot.v3.messaging import Configuration, ApiClient, MessagingApi, PushMessageRequest, TextMessage
-
-# 取得環境變數（支援 LINE_TOKEN 與 LINE_CHANNEL_ACCESS_TOKEN 相容性）
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-LINE_TOKEN = os.getenv("LINE_TOKEN") or os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-LINE_USER_ID = os.getenv("LINE_USER_ID")
-
-client = genai.Client(api_key=GEMINI_API_KEY)
-
-def fetch_google_news(query: str, max_items: int = 10) -> pd.DataFrame:
-    """從 Google News RSS 抓取新聞並清除 HTML 標籤。"""
-    q = quote_plus(query)
-    url = f"https://news.google.com/rss/search?q={q}&hl=zh-Hant&gl=TW&ceid=TW:zh-Hant"
-    feed = feedparser.parse(url)
-
-    rows = []
-    for entry in feed.entries[:max_items]:
-        raw_summary = entry.get("summary", "")
-        clean_summary = BeautifulSoup(raw_summary, "html.parser").get_text() if raw_summary else ""
-        rows.append({
-            "title": entry.get("title", ""),
-            "summary": clean_summary,
-            "link": entry.get("link", "")
-        })
-    return pd.DataFrame(rows)
-
-def call_gemini_with_retry(prompt: str, config, max_retries: int = 5, base_delay: float = 5.0):
+ 
+# 設定環境變數
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+LINE_TOKEN = os.environ.get("LINE_TOKEN")
+USER_ID = os.environ.get("LINE_USER_ID")
+ 
+def fetch_stock_df(ticker_symbol):
     """
-    呼叫 Gemini API,遇到 503 (伺服器過載) 或其他暫時性錯誤時自動重試,
-    採用指數退避 (exponential backoff)。
+    根據標的自動切換抓取來源：
+    - 台股 (.TW / .TWO) 使用 twstock (抓取近 60 天資料以足夠計算技術指標)
+    - 美股 使用 yfinance
     """
-    last_error = None
-    for attempt in range(1, max_retries + 1):
-        try:
-            response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt,
-                config=config
-            )
-            return response
-        except ServerError as e:
-            # 503 UNAVAILABLE、500 等伺服器端暫時性錯誤,值得重試
-            last_error = e
-            wait_time = base_delay * (2 ** (attempt - 1))  # 5s, 10s, 20s, 40s...
-            print(f"[警告] Gemini 伺服器錯誤 (第 {attempt}/{max_retries} 次嘗試): {e}")
-            if attempt < max_retries:
-                print(f"[重試] 等待 {wait_time:.0f} 秒後重試...")
-                time.sleep(wait_time)
-        except ClientError as e:
-            # 4xx 通常是請求本身有問題 (如 API Key 錯誤、request 格式錯誤),重試沒有意義
-            print(f"[錯誤] Gemini 用戶端錯誤,不重試: {e}")
-            raise
-
-    # 所有重試都失敗
-    print(f"[失敗] 已重試 {max_retries} 次仍失敗,放棄本次分析。")
-    raise last_error
-
-def analyze_investment_news(headlines: list[str], summaries: list[str]) -> list[dict]:
-    """評估閱讀等級與情緒，並針對 4 星以上新聞進行簡短精準的 6 大投資問題解析。"""
-    prompt = "請閱讀以下新聞，進行評分與 6 大投資問題解析：\n\n"
-    for i, h in enumerate(headlines):
-        prompt += f"新聞{i+1}:\n標題: {h}\n摘要: {summaries[i]}\n\n"
-
-    prompt += """
-【評分與回答規則】：
-1. reading_grade: 1~5 數值
-   - 1-3: 廢文/即時短訊/普通新聞
-   - 4-5: 深度產業分析/法說會重大動態
-2. sentiment_label: positive / neutral / negative
-3. sentiment_score: 0.0~1.0
-4. rationale: 1 句極簡理由。
-
-5. investment_qa (6 大投資問題解析)：
-   若 reading_grade 達 4 或 5 分，請「精簡條列、精準不誇大」回答下列 6 題，每題控制在 15 字以內。未提及則填「內文未提及」：
-   - Q1_benefited_product: 受惠產品/製程
-   - Q2_real_demand: 真實需求或想像
-   - Q3_trend: 短期拉貨或長期趨勢
-   - Q4_supply_demand: 供需狀況（缺貨/滿載）
-   - Q5_price_hike: 漲價原因（需求/成本）
-   - Q6_client_visibility: 客戶與訂單能見度
-
-若 reading_grade 未達 4 分，investment_qa 各項填「未達標」。
-    """
-
-    config = types.GenerateContentConfig(
-        response_mime_type="application/json",
-        response_schema={
-            "type": "ARRAY",
-            "items": {
-                "type": "OBJECT",
-                "properties": {
-                    "reading_grade": {"type": "INTEGER"},
-                    "sentiment_label": {"type": "STRING", "enum": ["positive", "neutral", "negative"]},
-                    "sentiment_score": {"type": "NUMBER"},
-                    "rationale": {"type": "STRING"},
-                    "investment_qa": {
-                        "type": "OBJECT",
-                        "properties": {
-                            "Q1_benefited_product": {"type": "STRING"},
-                            "Q2_real_demand": {"type": "STRING"},
-                            "Q3_trend": {"type": "STRING"},
-                            "Q4_supply_demand": {"type": "STRING"},
-                            "Q5_price_hike": {"type": "STRING"},
-                            "Q6_client_visibility": {"type": "STRING"}
-                        },
-                        "required": [
-                            "Q1_benefited_product", "Q2_real_demand", "Q3_trend",
-                            "Q4_supply_demand", "Q5_price_hike", "Q6_client_visibility"
-                        ]
-                    }
-                },
-                "required": ["reading_grade", "sentiment_label", "sentiment_score", "rationale", "investment_qa"]
-            }
-        }
-    )
-
-    response = call_gemini_with_retry(prompt, config)
-    return json.loads(response.text)
-
-def send_line_push(message_text: str):
-    """發送 LINE 推播訊息。"""
-    configuration = Configuration(access_token=LINE_TOKEN)
-    with ApiClient(configuration) as api_client:
-        line_bot_api = MessagingApi(api_client)
-        push_message_request = PushMessageRequest(
-            to=LINE_USER_ID,
-            messages=[TextMessage(text=message_text)]
-        )
-        line_bot_api.push_message(push_message_request)
-
-def main():
-    keyword = "台積電"
-    df = fetch_google_news(keyword, max_items=10)
-
-    if df.empty:
-        print("未抓取到新聞")
-        return
-
     try:
-        results = analyze_investment_news(df["title"].tolist(), df["summary"].tolist())
+        if ".TW" in ticker_symbol or ".TWO" in ticker_symbol:
+            code = ticker_symbol.replace(".TW", "").replace(".TWO", "")
+            stock = twstock.Stock(code)
+ 
+            # 計算約兩個月前（60 天）的年份與月份，確保有足夠 K 線計算 MACD/KD
+            start_date = datetime.now() - timedelta(days=60)
+            raw_data = stock.fetch_from(start_date.year, start_date.month)
+            if not raw_data:
+                return None, None
+ 
+            df = pd.DataFrame(raw_data)
+            df.rename(columns={
+                'date': 'Date', 'open': 'Open', 'high': 'High',
+                'low': 'Low', 'close': 'Close', 'capacity': 'Volume'
+            }, inplace=True)
+            df.set_index('Date', inplace=True)
+            latest_date = df.index[-1].strftime('%Y-%m-%d')
+            ref = f"資料來源: 臺灣證券交易所/櫃買中心 (截止: {latest_date})"
+            return df, ref
+        else:
+            stock = yf.Ticker(ticker_symbol)
+            df = stock.history(period="1y")
+            if df.empty or df['Close'].isnull().all():
+                return None, None
+            latest_date = df.index[-1].strftime('%Y-%m-%d')
+            ref = f"資料來源: Yahoo Finance (截止: {latest_date})"
+            return df, ref
     except Exception as e:
-        # Gemini 重試多次後仍失敗,記錄錯誤但不讓整個 workflow crash 成紅色
-        # (若希望 workflow 仍顯示失敗以利追蹤,可將下面這行改回 raise)
-        print(f"[致命錯誤] Gemini 分析失敗,本次跳過推播: {e}")
-        return
-
-    df_res = pd.DataFrame(results)
-    df_final = pd.concat([df, df_res], axis=1)
-
-    # 僅篩選閱讀等級 >= 4 星的高價值深度新聞
-    high_grade_news = df_final[df_final["reading_grade"] >= 4]
-
-    if not high_grade_news.empty:
-        for _, row in high_grade_news.iterrows():
-            sentiment_emoji = "🟢" if row["sentiment_label"] == "positive" else ("🔴" if row["sentiment_label"] == "negative" else "⚪")
-            stars = "⭐" * int(row["reading_grade"])
-            qa = row["investment_qa"]
-
-            # 極簡條列式排版
-            msg = f"📌 【{keyword} 深度報告】\n"
-            msg += f"📰 {row['title']}\n\n"
-            msg += f"評分：{stars} ({row['reading_grade']}/5)\n"
-            msg += f"情緒：{sentiment_emoji} {row['sentiment_label']} ({row['sentiment_score']})\n"
-            msg += f"摘要：{row['rationale']}\n"
-            msg += "-----------------------------------\n"
-            msg += "🎯 6 大基本面檢視：\n"
-            msg += f"• 受惠產品：{qa['Q1_benefited_product']}\n"
-            msg += f"• 真實需求：{qa['Q2_real_demand']}\n"
-            msg += f"• 趨勢性質：{qa['Q3_trend']}\n"
-            msg += f"• 供需狀況：{qa['Q4_supply_demand']}\n"
-            msg += f"• 漲價動因：{qa['Q5_price_hike']}\n"
-            msg += f"• 能 見 度：{qa['Q6_client_visibility']}\n"
-            msg += "-----------------------------------\n"
-            msg += f"🔗 原文網址：\n{row['link']}"
-
-            # LINE 單則推播上限為 2000 字
-            send_line_push(msg[:2000])
-        print(f"已成功推送 {len(high_grade_news)} 則簡短條列式投資檢視報告！")
-    else:
-        print("今日新聞未達到 4 星以上深度分析標準，無須推送。")
-
+        print(f"抓取 {ticker_symbol} 失敗: {e}")
+        return None, None
+ 
+def get_fundamentals(ticker_symbol):
+    """
+    透過 yfinance 取得基本面數據（台股/美股皆可用，因 Yahoo Finance 涵蓋 .TW / .TWO 標的）：
+    - 本益比 (P/E)、股價淨值比 (P/B)
+    - 毛利率、稅後淨利率、稅後淨利
+    - 營收年增率（作為市場需求的量化參考指標之一）
+    """
+    def pct(x):
+        return f"{x * 100:.1f}%" if isinstance(x, (int, float)) else "N/A"
+ 
+    def big_num(x):
+        if isinstance(x, (int, float)):
+            if abs(x) >= 1e9:
+                return f"{x / 1e9:.2f}B"
+            elif abs(x) >= 1e6:
+                return f"{x / 1e6:.2f}M"
+            return f"{x:,.0f}"
+        return "N/A"
+ 
+    try:
+        info = yf.Ticker(ticker_symbol).info
+        pe = info.get('trailingPE', 'N/A')
+        pb = info.get('priceToBook', 'N/A')
+        gross_margin = info.get('grossMargins')
+        net_margin = info.get('profitMargins')
+        net_income = info.get('netIncomeToCommon')
+        revenue_growth = info.get('revenueGrowth')
+        currency = info.get('currency', '')
+ 
+        fund_summary = (
+            f"P/E: {pe}, P/B: {pb}, "
+            f"毛利率: {pct(gross_margin)}, 稅後淨利率: {pct(net_margin)}, "
+            f"稅後淨利: {big_num(net_income)} {currency}, 營收年增率: {pct(revenue_growth)}"
+        )
+        return fund_summary
+    except Exception as e:
+        print(f"{ticker_symbol} 基本面資料取得失敗: {e}")
+        return "基本面資料: N/A（可能為未上市 ETF 或資料源無提供財報數據）"
+ 
+def get_full_analysis(ticker_symbol):
+    """完整指標計算與基本面整理"""
+    df, ref = fetch_stock_df(ticker_symbol)
+ 
+    if df is None or df.empty or len(df) < 15:
+        return None, None, None, None
+ 
+    latest = df.iloc[-1]
+    close_val = latest['Close']
+    high_val = latest['High']
+    low_val = latest['Low']
+ 
+    price_info = f"收盤: {close_val:.2f}, 最高: {high_val:.2f}, 最低: {low_val:.2f}"
+ 
+    # 計算技術指標
+    try:
+        df.ta.macd(append=True)
+        df.ta.rsi(append=True)
+        df.ta.bbands(append=True)
+        df.ta.stoch(append=True)
+ 
+        bbl = [c for c in df.columns if 'BBL' in c][0]
+        bbu = [c for c in df.columns if 'BBU' in c][0]
+        macd = [c for c in df.columns if 'MACD_' in c and 'MACDh' not in c and 'MACDs' not in c][0]
+        sk = [c for c in df.columns if 'STOCHk' in c][0]
+        sd = [c for c in df.columns if 'STOCHd' in c][0]
+        rsi = [c for c in df.columns if 'RSI' in c][0]
+ 
+        df['PCT_B'] = (df['Close'] - df[bbl]) / (df[bbu] - df[bbl])
+        latest_vals = df.iloc[-1]
+ 
+        tech_summary = f"RSI: {latest_vals.get(rsi, 0):.2f}, MACD: {latest_vals.get(macd, 0):.2f}, KD: {latest_vals.get(sk, 0):.2f}/{latest_vals.get(sd, 0):.2f}, %B: {latest_vals.get('PCT_B', 0):.2f}"
+    except Exception as e:
+        print(f"{ticker_symbol} 技術指標計算錯誤: {e}")
+        tech_summary = "指標計算中"
+ 
+    # 基本面數據（毛利率、稅後淨利率、稅後淨利、營收年增率等）
+    fund_summary = get_fundamentals(ticker_symbol)
+ 
+    return price_info, tech_summary, fund_summary, ref
+ 
+def build_prompt(ticker_symbol, ref, price_info, tech_summary, fund_summary):
+    """組出要求 AI 依六大投資判斷問題回答的 prompt"""
+    return f"""
+分析標的：{ticker_symbol}
+參考資料：{ref}
+今日行情：{price_info}
+技術面：{tech_summary}
+基本面：{fund_summary}
+ 
+你是一位客觀、嚴謹、不預設立場的資深投資分析師。請先實際搜尋並交叉查證公司最新的產品線、營收結構、客戶結構與產業新聞，確認上述基本面數據與你搜尋到的資訊是否一致，再依據以下 6 個問題逐項給出精煉結論（每項 1-2 句話，禁止空泛套話，需有具體依據）：
+ 
+1. 受惠產品：公司真正受惠的是哪一項產品或業務線？
+2. 真實需求 vs 市場想像：這項產品的需求是有實際訂單/出貨佐證，還是主要來自市場預期與想像？
+3. 需求週期：目前需求屬於短期拉貨（例如庫存回補、單一大單），還是長期結構性趨勢？
+4. 供需狀況：目前供需是否失衡？有無缺貨、漲價、產能滿載或擴產跡象？
+5. 漲價動能：若有漲價，主要是終端需求推動（賣方市場），還是原物料/成本上漲後的轉嫁？
+6. 客戶與能見度：主要客戶是誰（可指產業別，不確定則說明）？訂單能見度大約多長（例如：1季/2季/半年以上）？
+ 
+【格式要求】
+- 依上述 1~6 點條列輸出，每點前標註題號，不加開場白、問候語或免責聲明。
+- 最後加一行【結論】：綜合以上，給出中性、不預設立場的觀察重點（非投資建議用語，例如避免使用「買進/賣出」等字眼，改用「值得留意」「風險在於」等中性描述）。
+- 全文字數控制在 500 字以內。
+"""
+ 
+def generate_ai_analysis(client, prompt):
+    """
+    使用 Gemini 3.5 系列模型，並啟用 Google Search grounding，
+    讓模型在回答前能實際搜尋最新資訊進行交叉查證：
+    1. 主力模型：gemini-3.5-flash
+    2. 備用模型：gemini-3.5-flash-lite
+    """
+    PRIMARY_MODEL = "gemini-3.5-flash"
+    BACKUP_MODEL = "gemini-3.5-flash-lite"
+ 
+    search_config = types.GenerateContentConfig(
+        tools=[types.Tool(google_search=types.GoogleSearch())]
+    )
+ 
+    models_queue = [PRIMARY_MODEL, BACKUP_MODEL]
+    last_error = ""
+ 
+    for model_name in models_queue:
+        for attempt in range(3):
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=search_config
+                )
+                if response.text:
+                    is_backup = (model_name != PRIMARY_MODEL)
+                    version_tag = f"{model_name} [備用模型]" if is_backup else model_name
+                    return response.text.strip(), version_tag
+            except Exception as e:
+                err_msg = str(e)
+                last_error = err_msg
+ 
+                # 若遇到 404/NOT_FOUND，代表該 model ID 不存在，直接跳出換下一個 model
+                if "404" in err_msg or "NOT_FOUND" in err_msg:
+                    break
+ 
+                # 若遇到 503/429 流量限流，退避等待後重試
+                if "503" in err_msg or "429" in err_msg or "UNAVAILABLE" in err_msg:
+                    time.sleep((attempt + 1) * 6)
+                else:
+                    break
+ 
+    return f"AI 分析失敗 (原因: {last_error[:100]})", "失敗"
+ 
+def main():
+    if not GEMINI_API_KEY:
+        print("未設定 GEMINI_API_KEY")
+        sys.exit(1)
+ 
+    client = genai.Client(api_key=GEMINI_API_KEY)
+ 
+    tickers = ["2330.TW", "0050.TW", "NVDA", "AMD", "MU"]
+    report = f"📈 【Gemini AI 財務技術報告 Version 1.1.0】\n報告時間: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+ 
+    for t in tickers:
+        try:
+            price, tech, fund, ref = get_full_analysis(t)
+            if price:
+                prompt = build_prompt(t, ref, price, tech, fund)
+                ai_advice, used_version = generate_ai_analysis(client, prompt)
+                report += f"\n--- {t} ---\n【行情】{price}\n【指標】{tech}\n【基本】{fund}\n【AI建議 ({used_version})】\n{ai_advice}\n"
+ 
+                # 每個標的隔 6 秒，降低觸發 API 流量上限的機率
+                time.sleep(6)
+            else:
+                report += f"\n--- {t} ---\n⚠️ 無法取得該標的之有效行情資料\n"
+        except Exception as e:
+            report += f"\n{t} 分析失敗: {e}\n"
+ 
+    # 安全裁切，確保最終 LINE 訊息不超過官方上限 4,000 字
+    final_report = report[:3500] + "\n...(報告已截斷)" if len(report) > 3500 else report
+ 
+    # LINE 發送邏輯
+    if LINE_TOKEN and USER_ID:
+        payload = {"to": USER_ID, "messages": [{"type": "text", "text": final_report}]}
+        headers = {"Authorization": f"Bearer {LINE_TOKEN}", "Content-Type": "application/json"}
+        res = requests.post("https://api.line.me/v2/bot/message/push", headers=headers, json=payload)
+        print(f"LINE 發送狀態: {res.status_code}")
+ 
+    print(final_report)
+ 
 if __name__ == "__main__":
     main()
+ 
